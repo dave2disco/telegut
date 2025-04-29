@@ -193,12 +193,12 @@ async def handle_time_choice(update: Update, context: CallbackContext) -> int:
                 except Exception as e:
                     failed += 1
                     logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
-            await query.edit_message_text(f"✅ Messaggio inviato a {sent} utenti. ❌ Falliti: {failed}")
+            await query.edit_message_text(f"✅ Messaggio inviato a {sent} utenti.\n❌ Falliti: {failed}")
         finally:
             DB_POOL.putconn(conn)
     else:
         # Pianificazione: chiedi ore di ritardo
-        await query.edit_message_text("⏱️ Dopo quante ore vuoi inviare il messaggio? (inserisci un numero)")
+        await query.edit_message_text("⏱️ Dopo quante ore vuoi inviare il messaggio?")
         return WAITING_FOR_DELAY
 
     return ConversationHandler.END
