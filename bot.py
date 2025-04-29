@@ -12,6 +12,7 @@ from telegram.ext import (
     CallbackContext,
     filters
 )
+import asyncio
 
 # Configurazione logging
 logging.basicConfig(
@@ -20,14 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Inizializzazione Flask
 app = Flask(__name__)
-
-# Variabili globali
 application = None
 DB_POOL = None
 
-# Inizializzazione pool DB
 def init_db():
     global DB_POOL
     try:
@@ -37,8 +34,6 @@ def init_db():
             dsn=os.environ['DATABASE_URL']
         )
         logger.info("Pool di connessioni al database inizializzato")
-        
-        # Test connessione
         conn = DB_POOL.getconn()
         conn.close()
     except Exception as e:
@@ -46,29 +41,15 @@ def init_db():
         raise
 
 def get_db_conn():
-    try:
-        return DB_POOL.getconn()
-    except Exception as e:
-        logger.error(f"Errore ottenimento connessione DB: {e}")
-        return None
+    return DB_POOL.getconn()
 
 def return_db_conn(conn):
-    if conn:
-        try:
-            DB_POOL.putconn(conn)
-        except Exception as e:
-            logger.error(f"Errore restituzione connessione DB: {e}")
+    DB_POOL.putconn(conn)
 
-# Funzione per salvare/aggiornare utente
 async def save_user_id(user_id: int, username: str) -> bool:
-    conn = None
+    conn = get_db_conn()
     try:
-        conn = get_db_conn()
-        if not conn:
-            return False
-
         with conn.cursor() as cur:
-            # Crea tabella se non esiste
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
@@ -81,7 +62,6 @@ async def save_user_id(user_id: int, username: str) -> bool:
                 CREATE INDEX IF NOT EXISTS idx_last_interaction ON users(last_interaction);
             """)
             
-            # Inserimento/aggiornamento utente
             cur.execute("""
                 INSERT INTO users (user_id, username, last_interaction)
                 VALUES (%s, %s, %s)
@@ -94,74 +74,60 @@ async def save_user_id(user_id: int, username: str) -> bool:
             
             result = cur.fetchone()
             conn.commit()
-            
             return bool(result)
-            
     except Exception as e:
+        conn.rollback()
         logger.error(f"Errore DB: {e}")
-        if conn:
-            conn.rollback()
         return False
     finally:
         return_db_conn(conn)
 
-# Gestore comando /start
 async def start(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
     is_new = await save_user_id(user.id, user.first_name)
-    
     response = (
         f'✅ Ciao {user.first_name}! Registrazione completata.' if is_new 
         else f'👋 Bentornato {user.first_name}! Sei già registrato.'
     )
     await update.message.reply_text(response)
 
-# Endpoint webhook
 @app.route('/webhook', methods=['POST'])
 def webhook_handler():
-    if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        application.update_queue.put(update)
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    asyncio.run_coroutine_threadsafe(
+        application.process_update(update),
+        application.updater._io_loop.asyncio_loop  # pylint: disable=protected-access
+    )
     return 'ok', 200
 
-# Health check endpoint
 @app.route('/health')
 def health_check():
     try:
         conn = get_db_conn()
-        if conn:
-            conn.close()
-            return {'status': 'healthy', 'db': 'connected'}, 200
-        return {'status': 'warning', 'db': 'disconnected'}, 200
+        conn.close()
+        return {'status': 'healthy'}, 200
     except Exception as e:
         return {'status': 'error', 'error': str(e)}, 500
 
 def run_bot():
     global application
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
-    # Configurazione bot
     token = os.environ.get('TELEGRAM_TOKEN')
-    if not token:
-        logger.error("TELEGRAM_TOKEN mancante!")
-        return
-    
     application = Application.builder().token(token).build()
-    application.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("start", start))
     
-    # Configurazione webhook
     webhook_url = os.environ.get('WEBHOOK_URL')
-    if not webhook_url:
-        logger.error("WEBHOOK_URL mancante!")
-        return
-    
     application.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get('PORT', 5000)),
         webhook_url=webhook_url,
-        secret_token=os.environ.get('WEBHOOK_SECRET', 'default-secret')
+        secret_token=os.environ.get('WEBHOOK_SECRET'),
+        drop_pending_updates=True
     )
 
 if __name__ == '__main__':
     init_db()
     Thread(target=run_bot).start()
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False, use_reloader=False)
