@@ -3,8 +3,6 @@ import os
 import psycopg2
 from psycopg2 import pool
 from datetime import datetime
-from flask import Flask, request
-from threading import Thread
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -12,6 +10,7 @@ from telegram.ext import (
     CallbackContext,
     filters
 )
+from aiohttp import web
 import asyncio
 
 # Configurazione logging
@@ -21,10 +20,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-application = None
+# Variabili globali
 DB_POOL = None
+app = None
+runner = None
+site = None
 
+# Inizializzazione pool DB
 def init_db():
     global DB_POOL
     try:
@@ -40,14 +42,8 @@ def init_db():
         logger.error(f"Errore inizializzazione pool DB: {e}")
         raise
 
-def get_db_conn():
-    return DB_POOL.getconn()
-
-def return_db_conn(conn):
-    DB_POOL.putconn(conn)
-
 async def save_user_id(user_id: int, username: str) -> bool:
-    conn = get_db_conn()
+    conn = DB_POOL.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -80,7 +76,7 @@ async def save_user_id(user_id: int, username: str) -> bool:
         logger.error(f"Errore DB: {e}")
         return False
     finally:
-        return_db_conn(conn)
+        DB_POOL.putconn(conn)
 
 async def start(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
@@ -91,43 +87,64 @@ async def start(update: Update, context: CallbackContext) -> None:
     )
     await update.message.reply_text(response)
 
-@app.route('/webhook', methods=['POST'])
-def webhook_handler():
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    asyncio.run_coroutine_threadsafe(
-        application.process_update(update),
-        application.updater._io_loop.asyncio_loop  # pylint: disable=protected-access
-    )
-    return 'ok', 200
+async def webhook_handler(request):
+    if request.method == "POST":
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+    return web.Response(text="OK")
 
-@app.route('/health')
-def health_check():
+async def health_check(request):
     try:
-        conn = get_db_conn()
+        conn = DB_POOL.getconn()
         conn.close()
-        return {'status': 'healthy'}, 200
+        return web.json_response({'status': 'healthy'})
     except Exception as e:
-        return {'status': 'error', 'error': str(e)}, 500
+        return web.json_response({'status': 'error', 'error': str(e)}, status=500)
 
-def run_bot():
-    global application
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+async def on_startup(app):
+    await application.initialize()
+    await application.start()
+    await application.bot.set_webhook(
+        url=os.environ['WEBHOOK_URL'],
+        secret_token=os.environ['WEBHOOK_SECRET'],
+        max_connections=100
+    )
+
+async def on_shutdown(app):
+    await application.stop()
+    await application.shutdown()
+
+def main():
+    global application, app, runner, site
+
+    # Inizializzazione DB
+    init_db()
     
-    token = os.environ.get('TELEGRAM_TOKEN')
+    # Configurazione bot
+    token = os.environ['TELEGRAM_TOKEN']
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start))
     
-    webhook_url = os.environ.get('WEBHOOK_URL')
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get('PORT', 5000)),
-        webhook_url=webhook_url,
-        secret_token=os.environ.get('WEBHOOK_SECRET'),
-        drop_pending_updates=True
-    )
+    # Configurazione server web
+    app = web.Application()
+    app.router.add_post('/webhook', webhook_handler)
+    app.router.add_get('/health', health_check)
+    
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    runner = web.AppRunner(app)
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(runner.setup())
+    
+    site = web.TCPSite(
+        runner, 
+        host='0.0.0.0', 
+        port=int(os.environ.get('PORT', 5000))
+    
+    loop.run_until_complete(site.start())
+    loop.run_forever()
 
 if __name__ == '__main__':
-    init_db()
-    Thread(target=run_bot).start()
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False, use_reloader=False)
+    main()
