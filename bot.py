@@ -245,6 +245,7 @@ def main():
     init_db()
 
     try:
+        # Modifica qui l'inizializzazione del bot
         application = Application.builder().token(os.environ['TELEGRAM_TOKEN']).build()
         application.add_handler(CommandHandler("start", start))
 
@@ -271,6 +272,7 @@ def main():
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🚀 Avvio server su porta {port}")
     web.run_app(app, host='0.0.0.0', port=port, handle_signals=True)
+
 
 if __name__ == '__main__':
     main()
