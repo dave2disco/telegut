@@ -4,6 +4,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 import os
 import psycopg2
 from psycopg2 import sql
+from datetime import datetime
 
 # Configura il logging
 logging.basicConfig(
@@ -12,21 +13,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Funzione per gestire il comando /start
-def start(update: Update, context: CallbackContext) -> None:
-    user = update.effective_user
-    update.message.reply_text(f'Ciao {user.first_name}! Benvenuto nel mio bot.')
-    
-    # Salva l'ID utente nel database
-    save_user_id(user.id, user.first_name)
+# Funzione per verificare la connessione al database
+def check_db_connection():
+    try:
+        conn = psycopg2.connect(os.environ['DATABASE_URL'])
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Errore di connessione al database: {e}")
+        return False
 
 # Funzione per salvare l'ID utente nel database
-def save_user_id(user_id: int, username: str) -> None:
+# Restituisce True se l'utente è nuovo, False se già esisteva
+def save_user_id(user_id: int, username: str) -> bool:
     try:
-        # Connessione al database PostgreSQL
+        if not check_db_connection():
+            logger.error("Connessione al database non disponibile")
+            return False
+
         conn = psycopg2.connect(os.environ['DATABASE_URL'])
-        
-        # Crea un cursore per eseguire comandi SQL
         cur = conn.cursor()
         
         # Crea la tabella se non esiste
@@ -35,27 +40,49 @@ def save_user_id(user_id: int, username: str) -> None:
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT UNIQUE,
                 username VARCHAR(100),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_interaction TIMESTAMP
             )
         """)
         
-        # Inserisci l'utente (ignora se già esiste)
+        # Prova a inserire l'utente
         cur.execute("""
-            INSERT INTO users (user_id, username)
-            VALUES (%s, %s)
-            ON CONFLICT (user_id) DO NOTHING
-        """, (user_id, username))
+            INSERT INTO users (user_id, username, last_interaction)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) 
+            DO UPDATE SET last_interaction = %s
+            RETURNING id
+        """, (user_id, username, datetime.now(), datetime.now()))
         
-        # Salva le modifiche
+        # Se la riga è stata inserita (non esisteva), result conterrà qualcosa
+        result = cur.fetchone()
         conn.commit()
         
-        # Chiudi la connessione
         cur.close()
         conn.close()
         
-        logger.info(f"User {user_id} salvato nel database")
+        if result:  # Utente nuovo
+            logger.info(f"Nuovo utente registrato: {user_id}")
+            return True
+        else:  # Utente già esistente (aggiornato last_interaction)
+            logger.info(f"Utente già registrato: {user_id}")
+            return False
+            
     except Exception as e:
         logger.error(f"Errore nel salvataggio dell'utente: {e}")
+        return False
+
+# Funzione per gestire il comando /start
+def start(update: Update, context: CallbackContext) -> None:
+    user = update.effective_user
+    
+    # Salva l'ID utente e controlla se è nuovo
+    is_new_user = save_user_id(user.id, user.first_name)
+    
+    if is_new_user:
+        update.message.reply_text(f'Ciao {user.first_name}! Benvenuto nel mio bot. ✅ Sei stato registrato correttamente!')
+    else:
+        update.message.reply_text(f'Ciao di nuovo {user.first_name}! Sei già iscritto al bot.')
 
 # Funzione principale
 def main() -> None:
