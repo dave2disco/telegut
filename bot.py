@@ -76,7 +76,6 @@ async def schedule_broadcast(data, delay: float, bot, admin_id: int):
                 failed += 1
     finally:
         db_pool.putconn(conn)
-
     # Notifica admin
     await bot.send_message(
         chat_id=admin_id,
@@ -123,7 +122,6 @@ async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Contenuto non supportato. Usa testo, foto, video o documento.")
         return WAIT_MSG
-
     context.user_data['data'] = data
     context.user_data['admin_id'] = update.effective_user.id
     keyboard = [
@@ -139,11 +137,8 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data['data']
     admin_id = context.user_data['admin_id']
     if query.data == 'now':
-        # Invio immediato
         await schedule_broadcast(data, 0, context.bot, admin_id)
         return ConversationHandler.END
-
-    # Pianificazione: chiedi le ore di ritardo
     await query.edit_message_text("⏱️ Quante ore di ritardo? Inserisci un numero.")
     return WAIT_TIME
 
@@ -180,7 +175,7 @@ def main():
     app.add_handler(conv)
 
     port = int(os.getenv('PORT', 10000))
-        app.run_webhook(
+    app.run_webhook(
         listen='0.0.0.0',
         port=port,
         url_path='/webhook',
