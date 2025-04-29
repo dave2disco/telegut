@@ -3,7 +3,7 @@ import os
 import psycopg2
 from psycopg2 import pool
 from datetime import datetime
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -11,6 +11,7 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
+    CallbackQueryHandler,
 )
 from aiohttp import web
 import asyncio
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 DB_POOL = None
 application = None
 AUTHORIZED_USERS = [7618253421]
-WAITING_FOR_MESSAGE = 1
+WAITING_FOR_MESSAGE, WAITING_FOR_TIME = range(2)
 
 def init_db():
     global DB_POOL
@@ -138,34 +139,60 @@ async def messaggio_start(update: Update, context: CallbackContext) -> int:
 
 async def messaggio_send(update: Update, context: CallbackContext) -> int:
     text_to_send = update.message.text
-    sent = 0
-    failed = 0
+    context.user_data['message'] = text_to_send  # Memorizza il messaggio inviato
 
-    try:
-        conn = DB_POOL.getconn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM users")
-            users = cur.fetchall()
-        
-        for (user_id,) in users:
-            try:
-                await context.bot.send_message(chat_id=user_id, text=text_to_send)
-                sent += 1
-            except Exception as e:
-                failed += 1
-                logger.warning(f"⚠️ Impossibile inviare messaggio a {user_id}: {e}")
-        
-        await update.message.reply_text(f"✅ Messaggio inviato a {sent} utenti. ❌ Falliti: {failed}")
-    except Exception as e:
-        logger.error(f"❌ Errore durante l'invio broadcast: {e}")
-        await update.message.reply_text("⚠️ Errore durante l'invio del messaggio.")
-    finally:
-        DB_POOL.putconn(conn)
+    # Creazione dei pulsanti per decidere quando inviare il messaggio
+    keyboard = [
+        [
+            InlineKeyboardButton("INvia ORA", callback_data='send_now'),
+            InlineKeyboardButton("INvia DOPO", callback_data='send_later'),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    return ConversationHandler.END
+    await update.message.reply_text(
+        "Quando vuoi inviarlo?",
+        reply_markup=reply_markup
+    )
 
-async def messaggio_cancel(update: Update, context: CallbackContext) -> int:
-    await update.message.reply_text("❌ Operazione annullata.")
+    return WAITING_FOR_TIME
+
+async def handle_time_choice(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query
+    await query.answer()  # Risponde al click del bottone
+
+    # Se l'utente ha scelto "INvia ORA"
+    if query.data == 'send_now':
+        text_to_send = context.user_data.get('message')
+        sent = 0
+        failed = 0
+        try:
+            conn = DB_POOL.getconn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM users")
+                users = cur.fetchall()
+
+            for (user_id,) in users:
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=text_to_send)
+                    sent += 1
+                except Exception as e:
+                    failed += 1
+                    logger.warning(f"⚠️ Impossibile inviare messaggio a {user_id}: {e}")
+
+            await query.edit_message_text(f"✅ Messaggio inviato a {sent} utenti. ❌ Falliti: {failed}")
+
+        except Exception as e:
+            logger.error(f"❌ Errore durante l'invio broadcast: {e}")
+            await query.edit_message_text("⚠️ Errore durante l'invio del messaggio.")
+        finally:
+            DB_POOL.putconn(conn)
+
+    # Se l'utente ha scelto "INvia DOPO"
+    elif query.data == 'send_later':
+        await query.edit_message_text("⏳ Il messaggio sarà inviato successivamente.")
+        # Qui puoi aggiungere una logica per pianificare l'invio del messaggio
+
     return ConversationHandler.END
 
 # --- Webhook, Health Check ---
@@ -225,8 +252,9 @@ def main():
             entry_points=[CommandHandler("messaggio", messaggio_start)],
             states={
                 WAITING_FOR_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, messaggio_send)],
+                WAITING_FOR_TIME: [CallbackQueryHandler(handle_time_choice)],
             },
-            fallbacks=[CommandHandler("cancel", messaggio_cancel)],
+            fallbacks=[],
         )
         application.add_handler(conv_handler)
 
