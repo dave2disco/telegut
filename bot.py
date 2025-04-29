@@ -1,8 +1,8 @@
 import logging
 import os
-import psycopg2
-from psycopg2 import pool
 from datetime import datetime
+import asyncio
+from psycopg2 import pool
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,7 +13,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import asyncio
 
 # Configurazione logging
 logging.basicConfig(
@@ -22,20 +21,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Costanti e variabili globali
-DB_POOL = None
+# Costanti globali
+db_pool = None
 AUTHORIZED_USERS = [7618253421]
 WAIT_MSG, WAIT_TIME = range(2)
 
-# Funzione per inizializzare il database
+# Inizializza connessione al database
 def init_db():
-    global DB_POOL
-    DB_POOL = pool.SimpleConnectionPool(
+    global db_pool
+    db_pool = pool.SimpleConnectionPool(
         minconn=1,
         maxconn=10,
         dsn=os.environ['DATABASE_URL']
     )
-    conn = DB_POOL.getconn()
+    conn = db_pool.getconn()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -45,18 +44,18 @@ def init_db():
                 username TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_interaction TIMESTAMP
-            )
+            );
             """
         )
         conn.commit()
-    DB_POOL.putconn(conn)
+    db_pool.putconn(conn)
     logger.info("✅ Database inizializzato")
 
-# Funzione di scheduling del broadcast
+# Pianifica e invia broadcast
 async def schedule_broadcast(data, delay: float, bot, admin_id: int):
     await asyncio.sleep(delay)
     sent = failed = 0
-    conn = DB_POOL.getconn()
+    conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id FROM users")
@@ -76,24 +75,27 @@ async def schedule_broadcast(data, delay: float, bot, admin_id: int):
             except Exception:
                 failed += 1
     finally:
-        DB_POOL.putconn(conn)
-    # Notifica all'admin che ha pianificato
-    await bot.send_message(chat_id=admin_id,
-        text=f"✅ Messaggio inviato a {sent} utenti. ❌ Falliti: {failed}")
+        db_pool.putconn(conn)
+
+    # Notifica admin
+    await bot.send_message(
+        chat_id=admin_id,
+        text=f"✅ Messaggio inviato a {sent} utenti. ❌ Falliti: {failed}"
+    )
     logger.info(f"Broadcast completato: {sent} successi, {failed} falliti")
 
-# Handler dei comandi
+# Handler comandi
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    conn = DB_POOL.getconn()
+    conn = db_pool.getconn()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO users(user_id, username, last_interaction) VALUES(%s,%s,%s)"
+            "INSERT INTO users(user_id, username, last_interaction) VALUES(%s, %s, %s)"
             "ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username, last_interaction=EXCLUDED.last_interaction;",
             (user.id, user.first_name, datetime.now())
         )
         conn.commit()
-    DB_POOL.putconn(conn)
+    db_pool.putconn(conn)
     await update.message.reply_text(f"✅ Ciao {user.first_name}!")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,9 +105,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def messaggio_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in AUTHORIZED_USERS:
-        await update.message.reply_text("⛔ Non sei autorizzato.")
+        await update.message.reply_text("⛔ Non sei autorizzato a usare questo comando.")
         return ConversationHandler.END
-    await update.message.reply_text("✏️ Inviami il testo o media da inoltrare.")
+    await update.message.reply_text("✏️ Inviami testo o media da inoltrare.")
     return WAIT_MSG
 
 async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,11 +121,11 @@ async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif msg.document:
         data = {'type': 'document', 'file_id': msg.document.file_id, 'caption': msg.caption or ''}
     else:
-        await update.message.reply_text("Contenuto non supportato, invia testo, foto, video o documento.")
+        await update.message.reply_text("Contenuto non supportato. Usa testo, foto, video o documento.")
         return WAIT_MSG
 
     context.user_data['data'] = data
-    context.user_data['admin'] = update.effective_user.id
+    context.user_data['admin_id'] = update.effective_user.id
     keyboard = [
         [InlineKeyboardButton("Invia ORA", callback_data='now'),
          InlineKeyboardButton("Invia DOPO", callback_data='later')]
@@ -135,12 +137,13 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = context.user_data['data']
-    admin_id = context.user_data['admin']
+    admin_id = context.user_data['admin_id']
     if query.data == 'now':
         # Invio immediato
         await schedule_broadcast(data, 0, context.bot, admin_id)
         return ConversationHandler.END
-    # Pianificazione: chiedi le ore
+
+    # Pianificazione: chiedi le ore di ritardo
     await query.edit_message_text("⏱️ Quante ore di ritardo? Inserisci un numero.")
     return WAIT_TIME
 
@@ -153,16 +156,15 @@ async def delay_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAIT_TIME
     seconds = hours * 3600
     data = context.user_data['data']
-    admin_id = context.user_data['admin']
+    admin_id = context.user_data['admin_id']
     asyncio.create_task(schedule_broadcast(data, seconds, context.bot, admin_id))
     await update.message.reply_text(f"✅ Messaggio programmato tra {hours} ore.")
     return ConversationHandler.END
 
-if __name__ == '__main__':
+# Avvio dell'applicazione
+def main():
     init_db()
-    # Costruisci l'applicazione
     app = Application.builder().token(os.environ['TELEGRAM_TOKEN']).build()
-    # Handlers
     app.add_handler(CommandHandler('start', start))
     conv = ConversationHandler(
         entry_points=[CommandHandler('messaggio', messaggio_start)],
@@ -173,11 +175,11 @@ if __name__ == '__main__':
                 MessageHandler(filters.TEXT & ~filters.COMMAND, delay_input)
             ],
         },
-        fallbacks=[CommandHandler('annulla', cancel)],
+        fallbacks=[CommandHandler('annulla', cancel)]
     )
     app.add_handler(conv)
-    # Avvia come webhook
-        port = int(os.getenv('PORT', 10000))
+
+    port = int(os.getenv('PORT', 10000))
     app.run_webhook(
         listen='0.0.0.0',
         port=port,
@@ -186,3 +188,6 @@ if __name__ == '__main__':
         secret_token=os.environ['WEBHOOK_SECRET'],
         max_connections=40
     )
+
+if __name__ == '__main__':
+    main()
