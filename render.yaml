@@ -6,7 +6,7 @@ services:
       sudo apt-get update
       sudo apt-get install -y libpq-dev python3-dev
       pip install -r requirements.txt
-    startCommand: gunicorn --worker-tmp-dir /dev/shm --workers 4 --threads 2 --timeout 60 bot:app
+    startCommand: gunicorn --worker-class=gevent --workers 4 --bind 0.0.0.0:$PORT bot:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.1
