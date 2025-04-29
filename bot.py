@@ -291,8 +291,8 @@ async def on_startup(app):
 
 async def on_shutdown(app):
     try:
-        await application.stop()
-        await application.shutdown()
+        #await application.stop()
+        #await application.shutdown()
         DB_POOL.closeall()
         logger.info("⛔ Server spento correttamente")
     except Exception as e:
