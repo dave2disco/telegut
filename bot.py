@@ -27,48 +27,51 @@ logger = logging.getLogger(__name__)
 DB_POOL = None
 application = None
 AUTHORIZED_USERS = [7618253421, 1431237089, 599050162]
-# Stati conversazione
 WAITING_FOR_MESSAGE, WAITING_FOR_TIME, WAITING_FOR_DELAY, WAITING_FOR_CONFIRM = range(4)
+
+# Funzioni invio batch
+async def send_to_user(user_id, message_data, bot):
+    try:
+        mtype = message_data['type']
+        if mtype == 'text':
+            await bot.send_message(chat_id=user_id, text=message_data['text'])
+        elif mtype == 'photo':
+            await bot.send_photo(chat_id=user_id, photo=message_data['file_id'], caption=message_data.get('caption', ''))
+        elif mtype == 'video':
+            await bot.send_video(chat_id=user_id, video=message_data['file_id'], caption=message_data.get('caption', ''))
+        elif mtype == 'document':
+            await bot.send_document(chat_id=user_id, document=message_data['file_id'], caption=message_data.get('caption', ''))
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
+        return False
+
+async def send_to_all_users(users, message_data, bot, batch_size=20):
+    sent = failed = 0
+    for i in range(0, len(users), batch_size):
+        batch = users[i:i + batch_size]
+        tasks = [send_to_user(user_id[0], message_data, bot) for user_id in batch]
+        results = await asyncio.gather(*tasks)
+        sent += sum(1 for r in results if r)
+        failed += sum(1 for r in results if not r)
+        await asyncio.sleep(0.5)
+    return sent, failed
 
 # Funzione di scheduling
 async def schedule_broadcast(message_data: dict, delay_seconds: float, bot, admin_id: int):
     await asyncio.sleep(delay_seconds)
-    sent = failed = 0
     conn = DB_POOL.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id FROM users")
             users = cur.fetchall()
-        for (user_id,) in users:
-            try:
-                mtype = message_data['type']
-                if mtype == 'text':
-                    await bot.send_message(chat_id=user_id, text=message_data['text'])
-                elif mtype == 'photo':
-                    await bot.send_photo(chat_id=user_id,
-                                         photo=message_data['file_id'],
-                                         caption=message_data.get('caption', ''))
-                elif mtype == 'video':
-                    await bot.send_video(chat_id=user_id,
-                                          video=message_data['file_id'],
-                                          caption=message_data.get('caption', ''))
-                elif mtype == 'document':
-                    await bot.send_document(chat_id=user_id,
-                                             document=message_data['file_id'],
-                                             caption=message_data.get('caption', ''))
-                sent += 1
-            except Exception as e:
-                failed += 1
-                logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
-        await bot.send_message(
-            chat_id=admin_id,
-            text=f"✅ Messaggio inviato a {sent} utenti.\n❌ Falliti: {failed}"
-        )
+        sent, failed = await send_to_all_users(users, message_data, bot)
+        await bot.send_message(chat_id=admin_id, text=f"✅ Messaggio inviato a {sent} utenti.\n❌ Falliti: {failed}")
         logger.info(f"✅ Broadcast automatico inviato: {sent} successi, {failed} falliti")
     finally:
         DB_POOL.putconn(conn)
 
-# Funzione di conferma invio
+# Conferma invio
 def build_confirmation_markup():
     keyboard = [
         [
@@ -98,53 +101,30 @@ async def confirm_send_or_cancel(update: Update, context: CallbackContext) -> in
         await query.edit_message_text("❌ Invio annullato.")
         return ConversationHandler.END
 
-    # Confermato
     message_data = context.user_data.get('message_data')
     delay = context.user_data.get('delay_seconds', 0)
     admin_id = query.message.chat_id
 
     if delay > 0:
-        # Pianificato
         context.application.create_task(
             schedule_broadcast(message_data, delay, context.bot, admin_id)
         )
         hours = delay / 3600
         await query.edit_message_text(f"✅ Messaggio schedulato tra {hours:.2f} ore.")
     else:
-        # Invio immediato
-        sent = failed = 0
         conn = DB_POOL.getconn()
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT user_id FROM users")
                 users = cur.fetchall()
-            for (user_id,) in users:
-                try:
-                    mtype = message_data['type']
-                    if mtype == 'text':
-                        await context.bot.send_message(chat_id=user_id, text=message_data['text'])
-                    elif mtype == 'photo':
-                        await context.bot.send_photo(chat_id=user_id,
-                                                     photo=message_data['file_id'],
-                                                     caption=message_data.get('caption', ''))
-                    elif mtype == 'video':
-                        await context.bot.send_video(chat_id=user_id,
-                                                      video=message_data['file_id'],
-                                                      caption=message_data.get('caption', ''))
-                    elif mtype == 'document':
-                        await context.bot.send_document(chat_id=user_id,
-                                                        document=message_data['file_id'],
-                                                        caption=message_data.get('caption', ''))
-                    sent += 1
-                except Exception as e:
-                    failed += 1
-                    logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
+            sent, failed = await send_to_all_users(users, message_data, context.bot)
             await query.edit_message_text(f"✅ Messaggio inviato a {sent} utenti.\n❌ Falliti: {failed}")
         finally:
             DB_POOL.putconn(conn)
 
     return ConversationHandler.END
 
+# Funzioni database e bot
 def init_db():
     global DB_POOL
     try:
@@ -177,16 +157,14 @@ async def save_user_id(user_id: int, username: str) -> bool:
     conn = DB_POOL.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO users (user_id, username, last_interaction)
                 VALUES (%s, %s, %s)
                 ON CONFLICT (user_id)
                 DO UPDATE SET username = EXCLUDED.username,
                               last_interaction = EXCLUDED.last_interaction
                 RETURNING (xmax = 0) AS inserted;
-                """, (user_id, username, datetime.now())
-            )
+            """, (user_id, username, datetime.now()))
             inserted = cur.fetchone()[0]
             conn.commit()
             return inserted
@@ -197,6 +175,7 @@ async def save_user_id(user_id: int, username: str) -> bool:
     finally:
         DB_POOL.putconn(conn)
 
+# /start
 async def start(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
     try:
@@ -210,7 +189,7 @@ async def start(update: Update, context: CallbackContext) -> None:
         logger.error(f"❌ Errore comando /start: {e}")
         await update.message.reply_text('⚠️ Si è verificato un errore, riprova più tardi.')
 
-# --- Comando /messaggio (admin) ---
+# /messaggio
 async def messaggio_start(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
     if user_id not in AUTHORIZED_USERS:
@@ -257,6 +236,7 @@ async def handle_delay(update: Update, context: CallbackContext) -> int:
     context.user_data['delay_seconds'] = hours * 3600
     return await ask_confirmation(update, context)
 
+# Webhook
 async def webhook_handler(request):
     try:
         data = await request.json()
@@ -291,8 +271,6 @@ async def on_startup(app):
 
 async def on_shutdown(app):
     try:
-        #await application.stop()
-        #await application.shutdown()
         DB_POOL.closeall()
         logger.info("⛔ Server spento correttamente")
     except Exception as e:
