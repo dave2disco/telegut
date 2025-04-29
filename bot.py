@@ -31,7 +31,7 @@ def init_db():
         
         with DB_POOL.getconn() as conn:
             with conn.cursor() as cur:
-                # Prima crea la tabella base senza last_interaction
+                # Crea la tabella base
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                         id SERIAL PRIMARY KEY,
@@ -41,7 +41,7 @@ def init_db():
                     );
                 """)
                 
-                # Aggiungi la colonna se mancante
+                # Aggiungi la colonna last_interaction se mancante
                 cur.execute("""
                     DO $$
                     BEGIN
@@ -56,7 +56,7 @@ def init_db():
                     END$$;
                 """)
                 
-                # Ora crea gli indici
+                # Crea gli indici se non esistono
                 cur.execute("""
                     DO $$
                     BEGIN
@@ -89,6 +89,11 @@ async def save_user_id(user_id: int, username: str) -> bool:
     conn = DB_POOL.getconn()
     try:
         with conn.cursor() as cur:
+            # Verifica se l'utente esiste già
+            cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
+            exists = cur.fetchone() is not None
+
+            # Inserisce o aggiorna i dati
             cur.execute("""
                 INSERT INTO users (user_id, username, last_interaction)
                 VALUES (%s, %s, %s)
@@ -96,12 +101,10 @@ async def save_user_id(user_id: int, username: str) -> bool:
                 DO UPDATE SET 
                     username = EXCLUDED.username,
                     last_interaction = EXCLUDED.last_interaction
-                RETURNING id
             """, (user_id, username, datetime.now()))
             
-            result = cur.fetchone()
             conn.commit()
-            return bool(result)
+            return not exists  # True se nuovo, False se già esistente
     except Exception as e:
         conn.rollback()
         logger.error(f"❌ Errore DB: {e}")
@@ -115,7 +118,7 @@ async def start(update: Update, context: CallbackContext) -> None:
         is_new = await save_user_id(user.id, user.first_name)
         response = (
             f'✅ Ciao {user.first_name}! Registrazione completata.' if is_new 
-            else f'👋 Bentornato {user.first_name}! Sei già registrato.'
+            else f'👋 Sei già iscritto!'
         )
         await update.message.reply_text(response)
     except Exception as e:
@@ -167,10 +170,8 @@ async def on_shutdown(app):
 def main():
     global application
     
-    # Inizializzazione database
     init_db()
     
-    # Configurazione bot Telegram
     try:
         application = Application.builder().token(os.environ['TELEGRAM_TOKEN']).build()
         application.add_handler(CommandHandler("start", start))
@@ -179,14 +180,12 @@ def main():
         logger.error(f"❌ Errore configurazione bot: {e}")
         return
     
-    # Configurazione server web
     app = web.Application()
     app.router.add_post('/webhook', webhook_handler)
     app.router.add_get('/health', health_check)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     
-    # Avvio server
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🚀 Avvio server su porta {port}")
     web.run_app(app, host='0.0.0.0', port=port, handle_signals=True)
