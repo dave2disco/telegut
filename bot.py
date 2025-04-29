@@ -31,7 +31,7 @@ AUTHORIZED_USERS = [7618253421]
 WAITING_FOR_MESSAGE, WAITING_FOR_TIME, WAITING_FOR_DELAY = range(3)
 
 # Funzione di scheduling
-async def schedule_broadcast(message_data: dict, delay_seconds: float, bot):
+async def schedule_broadcast(message_data: dict, delay_seconds: float, bot, admin_id: int):
     await asyncio.sleep(delay_seconds)
     sent = failed = 0
     conn = DB_POOL.getconn()
@@ -46,8 +46,8 @@ async def schedule_broadcast(message_data: dict, delay_seconds: float, bot):
                     await bot.send_message(chat_id=user_id, text=message_data['text'])
                 elif mtype == 'photo':
                     await bot.send_photo(chat_id=user_id,
-                                           photo=message_data['file_id'],
-                                           caption=message_data.get('caption', ''))
+                                         photo=message_data['file_id'],
+                                         caption=message_data.get('caption', ''))
                 elif mtype == 'video':
                     await bot.send_video(chat_id=user_id,
                                           video=message_data['file_id'],
@@ -61,6 +61,15 @@ async def schedule_broadcast(message_data: dict, delay_seconds: float, bot):
                 failed += 1
                 logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
         logger.info(f"✅ Broadcast automatico inviato: {sent} successi, {failed} falliti")
+
+        # Notifica l’admin che ha programmato il messaggio
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=f"✅ Messaggio inviato a {sent} utenti.\n❌ Falliti: {failed}"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Impossibile notifica admin: {e}")
     finally:
         DB_POOL.putconn(conn)
 
@@ -211,8 +220,9 @@ async def handle_delay(update: Update, context: CallbackContext) -> int:
         return WAITING_FOR_DELAY
     seconds = hours * 3600
     message_data = context.user_data['message_data']
+    admin_id = update.effective_user.id
     context.application.create_task(
-        schedule_broadcast(message_data, seconds, context.bot)
+        schedule_broadcast(message_data, seconds, context.bot, admin_id)
     )
     await update.message.reply_text(f"✅ Messaggio programmato tra {hours} ore.")
     return ConversationHandler.END
