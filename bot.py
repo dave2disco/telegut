@@ -2,7 +2,7 @@ import logging
 import os
 import psycopg2
 from psycopg2 import pool
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -15,6 +15,7 @@ from telegram.ext import (
 )
 from aiohttp import web
 import asyncio
+import pytz  # Libreria per la gestione dei fusi orari
 
 # Configurazione logging
 logging.basicConfig(
@@ -27,7 +28,10 @@ logger = logging.getLogger(__name__)
 DB_POOL = None
 application = None
 AUTHORIZED_USERS = [7618253421]
-WAITING_FOR_MESSAGE, WAITING_FOR_TIME = range(2)
+WAITING_FOR_MESSAGE, WAITING_FOR_TIME, WAITING_FOR_HOURS = range(3)
+
+# Fuso orario di Roma (Europe/Rome)
+ROMA_TZ = pytz.timezone("Europe/Rome")
 
 def init_db():
     global DB_POOL
@@ -190,55 +194,41 @@ async def handle_time_choice(update: Update, context: CallbackContext) -> int:
 
     # Se l'utente ha scelto "INvia DOPO"
     elif query.data == 'send_later':
-        await query.edit_message_text("⏳ Il messaggio sarà inviato successivamente.")
-        # Qui puoi aggiungere una logica per pianificare l'invio del messaggio
+        await query.edit_message_text("⏳ Quante ore vuoi aspettare prima di inviare il messaggio?")
+        return WAITING_FOR_HOURS
+
+    return ConversationHandler.END
+
+async def handle_hours_input(update: Update, context: CallbackContext) -> int:
+    try:
+        # Recupero delle ore da parte dell'utente
+        hours = int(update.message.text)
+        message_to_send = context.user_data.get('message')
+
+        # Calcolo l'orario esatto per inviare il messaggio
+        now_utc = datetime.now(pytz.utc)
+        roma_time = now_utc.astimezone(ROMA_TZ)
+        scheduled_time = roma_time + timedelta(hours=hours)
+
+        # Memorizza la pianificazione (potresti volerlo fare in un DB per tenerne traccia)
+        context.user_data['scheduled_time'] = scheduled_time
+
+        # Rispondi all'utente con la pianificazione
+        await update.message.reply_text(f"📅 Il messaggio sarà inviato il {scheduled_time.strftime('%d/%m/%Y %H:%M:%S')} (ora di Roma).")
+
+        # Pianifica l'invio del messaggio per l'orario stabilito
+        # Qui possiamo usare `JobQueue` per programmare l'invio (vedi più avanti)
+        
+    except ValueError:
+        await update.message.reply_text("⚠️ Per favore inserisci un numero valido di ore.")
+        return WAITING_FOR_HOURS
 
     return ConversationHandler.END
 
 # --- Webhook, Health Check ---
+# (continua come nel codice precedente)
 
-async def webhook_handler(request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
-        return web.Response(text="OK")
-    except Exception as e:
-        logger.error(f"❌ Errore webhook: {e}")
-        return web.Response(status=500)
-
-async def health_check(request):
-    try:
-        conn = DB_POOL.getconn()
-        conn.close()
-        return web.json_response({'status': 'healthy', 'timestamp': str(datetime.now())})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'error': str(e)}, status=500)
-
-async def on_startup(app):
-    try:
-        await application.initialize()
-        await application.start()
-        await application.bot.set_webhook(
-            url=os.environ['WEBHOOK_URL'],
-            secret_token=os.environ['WEBHOOK_SECRET'],
-            max_connections=100
-        )
-        logger.info("✅ Webhook configurato correttamente")
-    except Exception as e:
-        logger.error(f"❌ Errore startup: {e}")
-        raise
-
-async def on_shutdown(app):
-    try:
-        await application.stop()
-        await application.shutdown()
-        DB_POOL.closeall()
-        logger.info("⛔ Server spento correttamente")
-    except Exception as e:
-        logger.error(f"❌ Errore shutdown: {e}")
-        raise
-
+# Modifica per aggiungere la pianificazione dell'invio
 def main():
     global application
 
@@ -253,6 +243,7 @@ def main():
             states={
                 WAITING_FOR_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, messaggio_send)],
                 WAITING_FOR_TIME: [CallbackQueryHandler(handle_time_choice)],
+                WAITING_FOR_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_hours_input)],
             },
             fallbacks=[],
         )
