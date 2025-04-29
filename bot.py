@@ -22,11 +22,8 @@ logger = logging.getLogger(__name__)
 
 # Variabili globali
 DB_POOL = None
-app = None
-runner = None
-site = None
+application = None
 
-# Inizializzazione pool DB
 def init_db():
     global DB_POOL
     try:
@@ -88,10 +85,9 @@ async def start(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(response)
 
 async def webhook_handler(request):
-    if request.method == "POST":
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
+    data = await request.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
     return web.Response(text="OK")
 
 async def health_check(request):
@@ -116,8 +112,8 @@ async def on_shutdown(app):
     await application.shutdown()
 
 def main():
-    global application, app, runner, site
-
+    global application
+    
     # Inizializzazione DB
     init_db()
     
@@ -134,17 +130,14 @@ def main():
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     
-    runner = web.AppRunner(app)
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(runner.setup())
-    
-    site = web.TCPSite(
-        runner, 
-        host='0.0.0.0', 
-        port=int(os.environ.get('PORT', 5000))
-    
-    loop.run_until_complete(site.start())
-    loop.run_forever()
+    # Avvio server
+    port = int(os.environ.get('PORT', 5000))
+    web.run_app(
+        app,
+        host='0.0.0.0',
+        port=port,
+        handle_signals=True
+    )
 
 if __name__ == '__main__':
     main()
