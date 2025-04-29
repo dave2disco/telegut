@@ -29,18 +29,35 @@ def init_db():
         )
         logger.info("✅ Pool di connessioni al database inizializzato")
         
-        # Verifica e crea schema
         with DB_POOL.getconn() as conn:
             with conn.cursor() as cur:
+                # Prima crea la tabella base senza last_interaction
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                         id SERIAL PRIMARY KEY,
                         user_id BIGINT UNIQUE,
                         username VARCHAR(100),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_interaction TIMESTAMP
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
-                    
+                """)
+                
+                # Aggiungi la colonna se mancante
+                cur.execute("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT column_name 
+                            FROM information_schema.columns 
+                            WHERE table_name = 'users' 
+                            AND column_name = 'last_interaction'
+                        ) THEN
+                            ALTER TABLE users ADD COLUMN last_interaction TIMESTAMP;
+                        END IF;
+                    END$$;
+                """)
+                
+                # Ora crea gli indici
+                cur.execute("""
                     DO $$
                     BEGIN
                         IF NOT EXISTS (
@@ -58,17 +75,9 @@ def init_db():
                         ) THEN
                             CREATE INDEX idx_last_interaction ON users(last_interaction);
                         END IF;
-                        
-                        IF NOT EXISTS (
-                            SELECT column_name 
-                            FROM information_schema.columns 
-                            WHERE table_name = 'users' 
-                            AND column_name = 'last_interaction'
-                        ) THEN
-                            ALTER TABLE users ADD COLUMN last_interaction TIMESTAMP;
-                        END IF;
                     END$$;
                 """)
+                
                 conn.commit()
         DB_POOL.putconn(conn)
         
