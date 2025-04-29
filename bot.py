@@ -4,18 +4,10 @@ import psycopg2
 from psycopg2 import pool
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackContext,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-    CallbackQueryHandler,
-)
+from telegram.ext import Application, CommandHandler, CallbackContext, ConversationHandler, MessageHandler, filters, CallbackQueryHandler
+import pytz
 from aiohttp import web
 import asyncio
-import pytz  # Libreria per la gestione dei fusi orari
 
 # Configurazione logging
 logging.basicConfig(
@@ -26,13 +18,11 @@ logger = logging.getLogger(__name__)
 
 # Variabili globali
 DB_POOL = None
-application = None
-AUTHORIZED_USERS = [7618253421]
+AUTHORIZED_USERS = [7618253421]  # Aggiungi il tuo ID utente
 WAITING_FOR_MESSAGE, WAITING_FOR_TIME, WAITING_FOR_HOURS = range(3)
-
-# Fuso orario di Roma (Europe/Rome)
 ROMA_TZ = pytz.timezone("Europe/Rome")
 
+# Funzione di inizializzazione del database
 def init_db():
     global DB_POOL
     try:
@@ -50,41 +40,9 @@ def init_db():
                         id SERIAL PRIMARY KEY,
                         user_id BIGINT UNIQUE,
                         username VARCHAR(100),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_interaction TIMESTAMP
                     );
-                """)
-                cur.execute("""
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT column_name 
-                            FROM information_schema.columns 
-                            WHERE table_name = 'users' 
-                            AND column_name = 'last_interaction'
-                        ) THEN
-                            ALTER TABLE users ADD COLUMN last_interaction TIMESTAMP;
-                        END IF;
-                    END$$;
-                """)
-                cur.execute("""
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM pg_indexes 
-                            WHERE tablename = 'users' 
-                            AND indexname = 'idx_user_id'
-                        ) THEN
-                            CREATE INDEX idx_user_id ON users(user_id);
-                        END IF;
-                        
-                        IF NOT EXISTS (
-                            SELECT 1 FROM pg_indexes 
-                            WHERE tablename = 'users' 
-                            AND indexname = 'idx_last_interaction'
-                        ) THEN
-                            CREATE INDEX idx_last_interaction ON users(last_interaction);
-                        END IF;
-                    END$$;
                 """)
                 conn.commit()
         DB_POOL.putconn(conn)
@@ -93,6 +51,7 @@ def init_db():
         logger.error(f"❌ Errore inizializzazione database: {e}")
         raise
 
+# Funzione per salvare l'utente nel database
 async def save_user_id(user_id: int, username: str) -> bool:
     conn = DB_POOL.getconn()
     try:
@@ -104,12 +63,12 @@ async def save_user_id(user_id: int, username: str) -> bool:
                 DO UPDATE SET 
                     username = EXCLUDED.username,
                     last_interaction = EXCLUDED.last_interaction
-                RETURNING (xmax = 0) AS inserted;
+                RETURNING id
             """, (user_id, username, datetime.now()))
             
             result = cur.fetchone()
             conn.commit()
-            return result[0]  # True se nuova registrazione, False se già esiste
+            return bool(result)
     except Exception as e:
         conn.rollback()
         logger.error(f"❌ Errore DB: {e}")
@@ -117,21 +76,21 @@ async def save_user_id(user_id: int, username: str) -> bool:
     finally:
         DB_POOL.putconn(conn)
 
+# Funzione per avviare il bot con il comando /start
 async def start(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
     try:
         is_new = await save_user_id(user.id, user.first_name)
         response = (
             f'✅ Ciao {user.first_name}! Registrazione completata.' if is_new 
-            else '👋 Sei già iscritto!'
+            else f'👋 Bentornato {user.first_name}! Sei già registrato.'
         )
         await update.message.reply_text(response)
     except Exception as e:
         logger.error(f"❌ Errore comando /start: {e}")
         await update.message.reply_text('⚠️ Si è verificato un errore, riprova più tardi.')
 
-# --- Comando /messaggio per inviare messaggi a tutti gli utenti (solo autorizzati) ---
-
+# Funzione per avviare il comando /messaggio
 async def messaggio_start(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
     if user_id not in AUTHORIZED_USERS:
@@ -141,6 +100,7 @@ async def messaggio_start(update: Update, context: CallbackContext) -> int:
     await update.message.reply_text("✏️ Inviami il messaggio da inoltrare a tutti gli utenti.")
     return WAITING_FOR_MESSAGE
 
+# Funzione per gestire l'invio del messaggio
 async def messaggio_send(update: Update, context: CallbackContext) -> int:
     text_to_send = update.message.text
     context.user_data['message'] = text_to_send  # Memorizza il messaggio inviato
@@ -161,6 +121,7 @@ async def messaggio_send(update: Update, context: CallbackContext) -> int:
 
     return WAITING_FOR_TIME
 
+# Funzione per gestire la scelta dell'orario di invio
 async def handle_time_choice(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()  # Risponde al click del bottone
@@ -199,6 +160,7 @@ async def handle_time_choice(update: Update, context: CallbackContext) -> int:
 
     return ConversationHandler.END
 
+# Funzione per gestire l'input delle ore
 async def handle_hours_input(update: Update, context: CallbackContext) -> int:
     try:
         # Recupero delle ore da parte dell'utente
@@ -217,7 +179,12 @@ async def handle_hours_input(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text(f"📅 Il messaggio sarà inviato il {scheduled_time.strftime('%d/%m/%Y %H:%M:%S')} (ora di Roma).")
 
         # Pianifica l'invio del messaggio per l'orario stabilito
-        # Qui possiamo usare `JobQueue` per programmare l'invio (vedi più avanti)
+        job_queue = context.job_queue
+        job_queue.run_once(
+            send_message_later,
+            when=scheduled_time,
+            context=context.user_data['message']
+        )
         
     except ValueError:
         await update.message.reply_text("⚠️ Per favore inserisci un numero valido di ore.")
@@ -225,10 +192,53 @@ async def handle_hours_input(update: Update, context: CallbackContext) -> int:
 
     return ConversationHandler.END
 
-# --- Webhook, Health Check ---
-# (continua come nel codice precedente)
+# Funzione per inviare il messaggio programmato
+async def send_message_later(context: CallbackContext) -> None:
+    text_to_send = context.job.context  # Messaggio da inviare
 
-# Modifica per aggiungere la pianificazione dell'invio
+    try:
+        conn = DB_POOL.getconn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users")
+            users = cur.fetchall()
+
+        sent = 0
+        failed = 0
+        for (user_id,) in users:
+            try:
+                await context.bot.send_message(chat_id=user_id, text=text_to_send)
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f"⚠️ Impossibile inviare messaggio a {user_id}: {e}")
+
+        logger.info(f"✅ Messaggio inviato a {sent} utenti. ❌ Falliti: {failed}")
+    
+    except Exception as e:
+        logger.error(f"❌ Errore durante l'invio broadcast programmato: {e}")
+    finally:
+        DB_POOL.putconn(conn)
+
+# Webhook, Health Check
+async def webhook_handler(request):
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return web.Response(text="OK")
+    except Exception as e:
+        logger.error(f"❌ Errore webhook: {e}")
+        return web.Response(status=500)
+
+async def health_check(request):
+    try:
+        conn = DB_POOL.getconn()
+        conn.close()
+        return web.json_response({'status': 'healthy', 'timestamp': str(datetime.now())})
+    except Exception as e:
+        return web.json_response({'status': 'error', 'error': str(e)}, status=500)
+
+# Funzione principale
 def main():
     global application
 
@@ -257,8 +267,6 @@ def main():
     app = web.Application()
     app.router.add_post('/webhook', webhook_handler)
     app.router.add_get('/health', health_check)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
 
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🚀 Avvio server su porta {port}")
