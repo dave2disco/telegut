@@ -178,11 +178,11 @@ if __name__ == '__main__':
     app.add_handler(conv)
     # Avvia come webhook
     port = int(os.getenv('PORT', 10000))
-    app.run_webhook(
+        app.run_webhook(
         listen='0.0.0.0',
         port=port,
-        webhook_path='/webhook',
-        webhook_url=os.environ['WEBHOOK_URL'],
+        path='/webhook',  # renamed parameter
+        url=os.environ['WEBHOOK_URL'],
         secret_token=os.environ['WEBHOOK_SECRET'],
         max_connections=40
     )
