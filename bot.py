@@ -3,38 +3,65 @@ from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 import os
 import psycopg2
-from psycopg2 import sql
 from datetime import datetime
+from flask import Flask, request
+from threading import Thread
+import time
 
-# Configura il logging
+# Configurazione logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Funzione per verificare la connessione al database
-def check_db_connection():
-    try:
-        conn = psycopg2.connect(os.environ['DATABASE_URL'])
-        conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"Errore di connessione al database: {e}")
-        return False
+# Inizializzazione Flask
+app = Flask(__name__)
 
-# Funzione per salvare l'ID utente nel database
-# Restituisce True se l'utente è nuovo, False se già esisteva
-def save_user_id(user_id: int, username: str) -> bool:
+# Variabili globali per l'updater
+updater = None
+dispatcher = None
+
+# Connessione al database con pool
+DB_POOL = None
+
+def init_db():
+    global DB_POOL
     try:
-        if not check_db_connection():
-            logger.error("Connessione al database non disponibile")
+        DB_POOL = psycopg2.pool.SimpleConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=os.environ['DATABASE_URL']
+        )
+        logger.info("Pool di connessioni al database inizializzato")
+    except Exception as e:
+        logger.error(f"Errore nell'inizializzazione del pool DB: {e}")
+        raise
+
+def get_db_conn():
+    try:
+        return DB_POOL.getconn()
+    except Exception as e:
+        logger.error(f"Errore nell'ottenere connessione DB: {e}")
+        return None
+
+def return_db_conn(conn):
+    try:
+        DB_POOL.putconn(conn)
+    except Exception as e:
+        logger.error(f"Errore nel restituire connessione DB: {e}")
+
+# Funzione per salvare/aggiornare utente
+def save_user_id(user_id: int, username: str) -> bool:
+    conn = None
+    try:
+        conn = get_db_conn()
+        if not conn:
             return False
 
-        conn = psycopg2.connect(os.environ['DATABASE_URL'])
         cur = conn.cursor()
         
-        # Crea la tabella se non esiste
+        # Crea tabella se non esiste con indici
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -42,69 +69,120 @@ def save_user_id(user_id: int, username: str) -> bool:
                 username VARCHAR(100),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_interaction TIMESTAMP
-            )
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_id ON users(user_id);
+            CREATE INDEX IF NOT EXISTS idx_last_interaction ON users(last_interaction);
         """)
         
-        # Prova a inserire l'utente
+        # Inserisci o aggiorna utente
         cur.execute("""
             INSERT INTO users (user_id, username, last_interaction)
             VALUES (%s, %s, %s)
             ON CONFLICT (user_id) 
-            DO UPDATE SET last_interaction = %s
+            DO UPDATE SET 
+                username = EXCLUDED.username,
+                last_interaction = EXCLUDED.last_interaction
             RETURNING id
-        """, (user_id, username, datetime.now(), datetime.now()))
+        """, (user_id, username, datetime.now()))
         
-        # Se la riga è stata inserita (non esisteva), result conterrà qualcosa
         result = cur.fetchone()
         conn.commit()
         
-        cur.close()
-        conn.close()
-        
-        if result:  # Utente nuovo
+        if result:
             logger.info(f"Nuovo utente registrato: {user_id}")
             return True
-        else:  # Utente già esistente (aggiornato last_interaction)
+        else:
             logger.info(f"Utente già registrato: {user_id}")
             return False
             
     except Exception as e:
-        logger.error(f"Errore nel salvataggio dell'utente: {e}")
+        logger.error(f"Errore DB: {e}")
+        if conn:
+            conn.rollback()
         return False
+    finally:
+        if conn:
+            return_db_conn(conn)
 
-# Funzione per gestire il comando /start
+# Gestore comando /start
 def start(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
+    is_new = save_user_id(user.id, user.first_name)
     
-    # Salva l'ID utente e controlla se è nuovo
-    is_new_user = save_user_id(user.id, user.first_name)
-    
-    if is_new_user:
-        update.message.reply_text(f'Ciao {user.first_name}! Benvenuto nel mio bot. ✅ Sei stato registrato correttamente!')
+    if is_new:
+        update.message.reply_text(f'✅ Ciao {user.first_name}! Registrazione completata.')
     else:
-        update.message.reply_text(f'Ciao di nuovo {user.first_name}! Sei già iscritto al bot.')
+        update.message.reply_text(f'👋 Bentornato {user.first_name}! Sei già registrato.')
 
-# Funzione principale
-def main() -> None:
-    # Prendi il token del bot dall'ambiente
+# Endpoint webhook
+@app.route('/webhook', methods=['POST'])
+def webhook_handler():
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), updater.bot)
+        dispatcher.process_update(update)
+    return 'ok', 200
+
+# Health check endpoint
+@app.route('/health')
+def health_check():
+    return {'status': 'healthy', 'timestamp': datetime.now().isoformat()}, 200
+
+# Funzione per impostare webhook
+def set_webhook():
+    webhook_url = os.environ.get('WEBHOOK_URL')
+    if not webhook_url:
+        logger.error("WEBHOOK_URL non configurato!")
+        return False
+    
+    try:
+        retry_count = 0
+        max_retries = 3
+        
+        while retry_count < max_retries:
+            try:
+                success = updater.bot.set_webhook(
+                    url=webhook_url,
+                    max_connections=100,
+                    allowed_updates=['message', 'callback_query']
+                )
+                if success:
+                    logger.info(f"Webhook configurato con successo: {webhook_url}")
+                    return True
+            except Exception as e:
+                logger.warning(f"Tentativo {retry_count + 1} fallito: {e}")
+                retry_count += 1
+                time.sleep(2)
+        
+        logger.error("Impossibile configurare webhook dopo diversi tentativi")
+        return False
+    except Exception as e:
+        logger.error(f"Errore critico nel webhook: {e}")
+        return False
+
+def main():
+    global updater, dispatcher
+    
+    # Inizializza pool DB
+    init_db()
+    
+    # Configura bot
     token = os.environ.get('TELEGRAM_TOKEN')
     if not token:
-        logger.error("Il token di Telegram non è configurato!")
+        logger.error("TELEGRAM_TOKEN mancante!")
         return
     
-    # Crea l'updater e passa il token del bot
-    updater = Updater(token)
-    
-    # Prendi il dispatcher per registrare i gestori
+    updater = Updater(token, use_context=True)
     dispatcher = updater.dispatcher
     
-    # Registra i gestori dei comandi
+    # Registra handlers
     dispatcher.add_handler(CommandHandler("start", start))
     
-    # Avvia il bot
-    updater.start_polling()
-    logger.info("Bot avviato e in ascolto...")
-    updater.idle()
+    # Configura webhook in un thread separato
+    Thread(target=set_webhook).start()
+    
+    # Avvia Flask
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
     main()
