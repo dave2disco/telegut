@@ -2,8 +2,10 @@ services:
   - type: web
     name: telegram-bot
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --workers 4 --threads 2 --timeout 60 bot:app
+    buildCommand: |
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: gunicorn --worker-tmp-dir /dev/shm --workers 4 --threads 2 --timeout 60 bot:app
     envVars:
       - key: DATABASE_URL
         fromDatabase:
