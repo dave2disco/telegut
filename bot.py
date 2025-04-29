@@ -2,7 +2,7 @@ import logging
 import os
 import psycopg2
 from psycopg2 import pool
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -27,7 +27,43 @@ logger = logging.getLogger(__name__)
 DB_POOL = None
 application = None
 AUTHORIZED_USERS = [7618253421]
-WAITING_FOR_MESSAGE, WAITING_FOR_TIME = range(2)
+# Stati conversazione
+WAITING_FOR_MESSAGE, WAITING_FOR_TIME, WAITING_FOR_DELAY = range(3)
+
+# Funzione di scheduling
+async def schedule_broadcast(message_data: dict, delay_seconds: float, bot):
+    await asyncio.sleep(delay_seconds)
+    sent = failed = 0
+    conn = DB_POOL.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users")
+            users = cur.fetchall()
+        for (user_id,) in users:
+            try:
+                mtype = message_data['type']
+                if mtype == 'text':
+                    await bot.send_message(chat_id=user_id, text=message_data['text'])
+                elif mtype == 'photo':
+                    await bot.send_photo(chat_id=user_id,
+                                           photo=message_data['file_id'],
+                                           caption=message_data.get('caption', ''))
+                elif mtype == 'video':
+                    await bot.send_video(chat_id=user_id,
+                                          video=message_data['file_id'],
+                                          caption=message_data.get('caption', ''))
+                elif mtype == 'document':
+                    await bot.send_document(chat_id=user_id,
+                                             document=message_data['file_id'],
+                                             caption=message_data.get('caption', ''))
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
+        logger.info(f"✅ Broadcast automatico inviato: {sent} successi, {failed} falliti")
+    finally:
+        DB_POOL.putconn(conn)
+
 
 def init_db():
     global DB_POOL
@@ -38,53 +74,21 @@ def init_db():
             dsn=os.environ['DATABASE_URL']
         )
         logger.info("✅ Pool di connessioni al database inizializzato")
-        
-        with DB_POOL.getconn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT UNIQUE,
-                        username VARCHAR(100),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """)
-                cur.execute("""
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT column_name 
-                            FROM information_schema.columns 
-                            WHERE table_name = 'users' 
-                            AND column_name = 'last_interaction'
-                        ) THEN
-                            ALTER TABLE users ADD COLUMN last_interaction TIMESTAMP;
-                        END IF;
-                    END$$;
-                """)
-                cur.execute("""
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM pg_indexes 
-                            WHERE tablename = 'users' 
-                            AND indexname = 'idx_user_id'
-                        ) THEN
-                            CREATE INDEX idx_user_id ON users(user_id);
-                        END IF;
-                        
-                        IF NOT EXISTS (
-                            SELECT 1 FROM pg_indexes 
-                            WHERE tablename = 'users' 
-                            AND indexname = 'idx_last_interaction'
-                        ) THEN
-                            CREATE INDEX idx_last_interaction ON users(last_interaction);
-                        END IF;
-                    END$$;
-                """)
-                conn.commit()
+        conn = DB_POOL.getconn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT UNIQUE,
+                    username VARCHAR(100),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_interaction TIMESTAMP
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_user_id ON users(user_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_last_interaction ON users(last_interaction);")
+            conn.commit()
         DB_POOL.putconn(conn)
-        
     except Exception as e:
         logger.error(f"❌ Errore inizializzazione database: {e}")
         raise
@@ -93,19 +97,19 @@ async def save_user_id(user_id: int, username: str) -> bool:
     conn = DB_POOL.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO users (user_id, username, last_interaction)
                 VALUES (%s, %s, %s)
-                ON CONFLICT (user_id) 
-                DO UPDATE SET 
-                    username = EXCLUDED.username,
-                    last_interaction = EXCLUDED.last_interaction
+                ON CONFLICT (user_id)
+                DO UPDATE SET username = EXCLUDED.username,
+                              last_interaction = EXCLUDED.last_interaction
                 RETURNING (xmax = 0) AS inserted;
-            """, (user_id, username, datetime.now()))
-            
-            result = cur.fetchone()
+                """, (user_id, username, datetime.now())
+            )
+            inserted = cur.fetchone()[0]
             conn.commit()
-            return result[0]  # True se nuova registrazione, False se già esiste
+            return inserted
     except Exception as e:
         conn.rollback()
         logger.error(f"❌ Errore DB: {e}")
@@ -118,7 +122,7 @@ async def start(update: Update, context: CallbackContext) -> None:
     try:
         is_new = await save_user_id(user.id, user.first_name)
         response = (
-            f'✅ Ciao {user.first_name}! Registrazione completata.' if is_new 
+            f'✅ Ciao {user.first_name}! Registrazione completata.' if is_new
             else '👋 Sei già iscritto!'
         )
         await update.message.reply_text(response)
@@ -126,77 +130,94 @@ async def start(update: Update, context: CallbackContext) -> None:
         logger.error(f"❌ Errore comando /start: {e}")
         await update.message.reply_text('⚠️ Si è verificato un errore, riprova più tardi.')
 
-# --- Comando /messaggio per inviare messaggi a tutti gli utenti (solo autorizzati) ---
-
+# --- Comando /messaggio (admin) ---
 async def messaggio_start(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
     if user_id not in AUTHORIZED_USERS:
         await update.message.reply_text("⛔ Non sei autorizzato a usare questo comando.")
         return ConversationHandler.END
-
-    await update.message.reply_text("✏️ Inviami il messaggio da inoltrare a tutti gli utenti.")
+    await update.message.reply_text("✏️ Inviami il messaggio (testo o multimediale) da inoltrare.")
     return WAITING_FOR_MESSAGE
 
 async def messaggio_send(update: Update, context: CallbackContext) -> int:
-    text_to_send = update.message.text
-    context.user_data['message'] = text_to_send  # Memorizza il messaggio inviato
-
-    # Creazione dei pulsanti per decidere quando inviare il messaggio
+    msg = update.message
+    # Rileva tipo di contenuto
+    data = {'type': 'text', 'text': msg.text or ''}
+    if msg.photo:
+        data = {'type': 'photo', 'file_id': msg.photo[-1].file_id, 'caption': msg.caption or ''}
+    elif msg.video:
+        data = {'type': 'video', 'file_id': msg.video.file_id, 'caption': msg.caption or ''}
+    elif msg.document:
+        data = {'type': 'document', 'file_id': msg.document.file_id, 'caption': msg.caption or ''}
+    context.user_data['message_data'] = data
+    # Inline keyboard per scelta invio
     keyboard = [
-        [
-            InlineKeyboardButton("INvia ORA", callback_data='send_now'),
-            InlineKeyboardButton("INvia DOPO", callback_data='send_later'),
-        ]
+        [InlineKeyboardButton("Invia ORA", callback_data='send_now'),
+         InlineKeyboardButton("Invia DOPO", callback_data='send_later')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "Quando vuoi inviarlo?",
-        reply_markup=reply_markup
-    )
-
+    await update.message.reply_text("Quando vuoi inviarlo?", reply_markup=reply_markup)
     return WAITING_FOR_TIME
 
 async def handle_time_choice(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    await query.answer()  # Risponde al click del bottone
+    await query.answer()
+    choice = query.data
+    message_data = context.user_data['message_data']
 
-    # Se l'utente ha scelto "INvia ORA"
-    if query.data == 'send_now':
-        text_to_send = context.user_data.get('message')
-        sent = 0
-        failed = 0
+    if choice == 'send_now':
+        # Invia immediatamente
+        sent = failed = 0
+        conn = DB_POOL.getconn()
         try:
-            conn = DB_POOL.getconn()
             with conn.cursor() as cur:
                 cur.execute("SELECT user_id FROM users")
                 users = cur.fetchall()
-
             for (user_id,) in users:
                 try:
-                    await context.bot.send_message(chat_id=user_id, text=text_to_send)
+                    if message_data['type'] == 'text':
+                        await context.bot.send_message(chat_id=user_id, text=message_data['text'])
+                    elif message_data['type'] == 'photo':
+                        await context.bot.send_photo(chat_id=user_id,
+                                                     photo=message_data['file_id'],
+                                                     caption=message_data['caption'])
+                    elif message_data['type'] == 'video':
+                        await context.bot.send_video(chat_id=user_id,
+                                                      video=message_data['file_id'],
+                                                      caption=message_data['caption'])
+                    elif message_data['type'] == 'document':
+                        await context.bot.send_document(chat_id=user_id,
+                                                        document=message_data['file_id'],
+                                                        caption=message_data['caption'])
                     sent += 1
                 except Exception as e:
                     failed += 1
-                    logger.warning(f"⚠️ Impossibile inviare messaggio a {user_id}: {e}")
-
+                    logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
             await query.edit_message_text(f"✅ Messaggio inviato a {sent} utenti. ❌ Falliti: {failed}")
-
-        except Exception as e:
-            logger.error(f"❌ Errore durante l'invio broadcast: {e}")
-            await query.edit_message_text("⚠️ Errore durante l'invio del messaggio.")
         finally:
             DB_POOL.putconn(conn)
-
-    # Se l'utente ha scelto "INvia DOPO"
-    elif query.data == 'send_later':
-        await query.edit_message_text("⏳ Il messaggio sarà inviato successivamente.")
-        # Qui puoi aggiungere una logica per pianificare l'invio del messaggio
+    else:
+        # Pianificazione: chiedi ore di ritardo
+        await query.edit_message_text("⏱️ Dopo quante ore vuoi inviare il messaggio? (inserisci un numero)")
+        return WAITING_FOR_DELAY
 
     return ConversationHandler.END
 
-# --- Webhook, Health Check ---
+async def handle_delay(update: Update, context: CallbackContext) -> int:
+    try:
+        hours = float(update.message.text.replace(',', '.'))
+    except ValueError:
+        await update.message.reply_text("❌ Inserisci un numero valido di ore.")
+        return WAITING_FOR_DELAY
+    seconds = hours * 3600
+    message_data = context.user_data['message_data']
+    context.application.create_task(
+        schedule_broadcast(message_data, seconds, context.bot)
+    )
+    await update.message.reply_text(f"✅ Messaggio programmato tra {hours} ore.")
+    return ConversationHandler.END
 
+# --- Webhook e Health Check ---
 async def webhook_handler(request):
     try:
         data = await request.json()
@@ -241,36 +262,25 @@ async def on_shutdown(app):
 
 def main():
     global application
-
     init_db()
-
-    try:
-        application = Application.builder().token(os.environ['TELEGRAM_TOKEN']).build()
-        application.add_handler(CommandHandler("start", start))
-
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler("messaggio", messaggio_start)],
-            states={
-                WAITING_FOR_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, messaggio_send)],
-                WAITING_FOR_TIME: [CallbackQueryHandler(handle_time_choice)],
-            },
-            fallbacks=[],
-        )
-        application.add_handler(conv_handler)
-
-        logger.info("✅ Bot Telegram configurato")
-    except Exception as e:
-        logger.error(f"❌ Errore configurazione bot: {e}")
-        return
-
+    application = Application.builder().token(os.environ['TELEGRAM_TOKEN']).build()
+    application.add_handler(CommandHandler("start", start))
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("messaggio", messaggio_start)],
+        states={
+            WAITING_FOR_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, messaggio_send)],
+            WAITING_FOR_TIME: [CallbackQueryHandler(handle_time_choice)],
+            WAITING_FOR_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delay)],
+        },
+        fallbacks=[],
+    )
+    application.add_handler(conv)
     app = web.Application()
     app.router.add_post('/webhook', webhook_handler)
     app.router.add_get('/health', health_check)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-
     port = int(os.environ.get('PORT', 10000))
-    logger.info(f"🚀 Avvio server su porta {port}")
     web.run_app(app, host='0.0.0.0', port=port, handle_signals=True)
 
 if __name__ == '__main__':
