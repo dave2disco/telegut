@@ -2,7 +2,7 @@ import logging
 import os
 import psycopg2
 from psycopg2 import pool
-from datetime import datetime, timedelta
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -28,7 +28,7 @@ DB_POOL = None
 application = None
 AUTHORIZED_USERS = [7618253421]
 # Stati conversazione
-WAITING_FOR_MESSAGE, WAITING_FOR_TIME, WAITING_FOR_DELAY = range(3)
+WAITING_FOR_MESSAGE, WAITING_FOR_TIME, WAITING_FOR_DELAY, WAITING_FOR_CONFIRM = range(4)
 
 # Funzione di scheduling
 async def schedule_broadcast(message_data: dict, delay_seconds: float, bot, admin_id: int):
@@ -60,19 +60,90 @@ async def schedule_broadcast(message_data: dict, delay_seconds: float, bot, admi
             except Exception as e:
                 failed += 1
                 logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
+        await bot.send_message(
+            chat_id=admin_id,
+            text=f"✅ Messaggio inviato a {sent} utenti.\n❌ Falliti: {failed}"
+        )
         logger.info(f"✅ Broadcast automatico inviato: {sent} successi, {failed} falliti")
-
-        # Notifica l’admin che ha programmato il messaggio
-        try:
-            await bot.send_message(
-                chat_id=admin_id,
-                text=f"✅ Messaggio inviato a {sent} utenti.\n❌ Falliti: {failed}"
-            )
-        except Exception as e:
-            logger.warning(f"⚠️ Impossibile notifica admin: {e}")
     finally:
         DB_POOL.putconn(conn)
 
+# Funzione di conferma invio
+def build_confirmation_markup():
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Conferma invio", callback_data='confirm_send'),
+            InlineKeyboardButton("❌ Annulla invio", callback_data='cancel_send')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def ask_confirmation(update, context: CallbackContext) -> int:
+    markup = build_confirmation_markup()
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text="Vuoi procedere con l'invio?", reply_markup=markup
+        )
+    else:
+        await update.message.reply_text(
+            text="Vuoi procedere con l'invio?", reply_markup=markup
+        )
+    return WAITING_FOR_CONFIRM
+
+async def confirm_send_or_cancel(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    if choice == 'cancel_send':
+        await query.edit_message_text("❌ Invio annullato.")
+        return ConversationHandler.END
+
+    # Confermato
+    message_data = context.user_data.get('message_data')
+    delay = context.user_data.get('delay_seconds', 0)
+    admin_id = query.message.chat_id
+
+    if delay > 0:
+        # Pianificato
+        context.application.create_task(
+            schedule_broadcast(message_data, delay, context.bot, admin_id)
+        )
+        hours = delay / 3600
+        await query.edit_message_text(f"✅ Messaggio schedulato tra {hours:.2f} ore.")
+    else:
+        # Invio immediato
+        sent = failed = 0
+        conn = DB_POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM users")
+                users = cur.fetchall()
+            for (user_id,) in users:
+                try:
+                    mtype = message_data['type']
+                    if mtype == 'text':
+                        await context.bot.send_message(chat_id=user_id, text=message_data['text'])
+                    elif mtype == 'photo':
+                        await context.bot.send_photo(chat_id=user_id,
+                                                     photo=message_data['file_id'],
+                                                     caption=message_data.get('caption', ''))
+                    elif mtype == 'video':
+                        await context.bot.send_video(chat_id=user_id,
+                                                      video=message_data['file_id'],
+                                                      caption=message_data.get('caption', ''))
+                    elif mtype == 'document':
+                        await context.bot.send_document(chat_id=user_id,
+                                                        document=message_data['file_id'],
+                                                        caption=message_data.get('caption', ''))
+                    sent += 1
+                except Exception as e:
+                    failed += 1
+                    logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
+            await query.edit_message_text(f"✅ Messaggio inviato a {sent} utenti.\n❌ Falliti: {failed}")
+        finally:
+            DB_POOL.putconn(conn)
+
+    return ConversationHandler.END
 
 def init_db():
     global DB_POOL
@@ -150,7 +221,6 @@ async def messaggio_start(update: Update, context: CallbackContext) -> int:
 
 async def messaggio_send(update: Update, context: CallbackContext) -> int:
     msg = update.message
-    # Rileva tipo di contenuto
     data = {'type': 'text', 'text': msg.text or ''}
     if msg.photo:
         data = {'type': 'photo', 'file_id': msg.photo[-1].file_id, 'caption': msg.caption or ''}
@@ -159,58 +229,24 @@ async def messaggio_send(update: Update, context: CallbackContext) -> int:
     elif msg.document:
         data = {'type': 'document', 'file_id': msg.document.file_id, 'caption': msg.caption or ''}
     context.user_data['message_data'] = data
-    # Inline keyboard per scelta invio
     keyboard = [
         [InlineKeyboardButton("Invia ORA", callback_data='send_now'),
          InlineKeyboardButton("Invia DOPO", callback_data='send_later')]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Quando vuoi inviarlo?", reply_markup=reply_markup)
+    markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Quando vuoi inviarlo?", reply_markup=markup)
     return WAITING_FOR_TIME
 
 async def handle_time_choice(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
     choice = query.data
-    message_data = context.user_data['message_data']
-
     if choice == 'send_now':
-        # Invia immediatamente
-        sent = failed = 0
-        conn = DB_POOL.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT user_id FROM users")
-                users = cur.fetchall()
-            for (user_id,) in users:
-                try:
-                    if message_data['type'] == 'text':
-                        await context.bot.send_message(chat_id=user_id, text=message_data['text'])
-                    elif message_data['type'] == 'photo':
-                        await context.bot.send_photo(chat_id=user_id,
-                                                     photo=message_data['file_id'],
-                                                     caption=message_data['caption'])
-                    elif message_data['type'] == 'video':
-                        await context.bot.send_video(chat_id=user_id,
-                                                      video=message_data['file_id'],
-                                                      caption=message_data['caption'])
-                    elif message_data['type'] == 'document':
-                        await context.bot.send_document(chat_id=user_id,
-                                                        document=message_data['file_id'],
-                                                        caption=message_data['caption'])
-                    sent += 1
-                except Exception as e:
-                    failed += 1
-                    logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
-            await query.edit_message_text(f"✅ Messaggio inviato a {sent} utenti.\n❌ Falliti: {failed}")
-        finally:
-            DB_POOL.putconn(conn)
+        context.user_data['delay_seconds'] = 0
+        return await ask_confirmation(update, context)
     else:
-        # Pianificazione: chiedi ore di ritardo
         await query.edit_message_text("⏱️ Dopo quante ore vuoi inviare il messaggio?")
         return WAITING_FOR_DELAY
-
-    return ConversationHandler.END
 
 async def handle_delay(update: Update, context: CallbackContext) -> int:
     try:
@@ -218,16 +254,9 @@ async def handle_delay(update: Update, context: CallbackContext) -> int:
     except ValueError:
         await update.message.reply_text("❌ Inserisci un numero valido di ore.")
         return WAITING_FOR_DELAY
-    seconds = hours * 3600
-    message_data = context.user_data['message_data']
-    admin_id = update.effective_user.id
-    context.application.create_task(
-        schedule_broadcast(message_data, seconds, context.bot, admin_id)
-    )
-    await update.message.reply_text(f"✅ Messaggio programmato tra {hours} ore.")
-    return ConversationHandler.END
+    context.user_data['delay_seconds'] = hours * 3600
+    return await ask_confirmation(update, context)
 
-# --- Webhook e Health Check ---
 async def webhook_handler(request):
     try:
         data = await request.json()
@@ -281,6 +310,7 @@ def main():
             WAITING_FOR_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, messaggio_send)],
             WAITING_FOR_TIME: [CallbackQueryHandler(handle_time_choice)],
             WAITING_FOR_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delay)],
+            WAITING_FOR_CONFIRM: [CallbackQueryHandler(confirm_send_or_cancel)],
         },
         fallbacks=[],
     )
