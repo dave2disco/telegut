@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # Variabili globali
 DB_POOL = None
 application = None
-AUTHORIZED_USERS = [7618253421]
+AUTHORIZED_USERS = [7618253421, 1431237089, 599050162]
 # Stati conversazione
 WAITING_FOR_MESSAGE, WAITING_FOR_TIME, WAITING_FOR_DELAY, WAITING_FOR_CONFIRM = range(4)
 
