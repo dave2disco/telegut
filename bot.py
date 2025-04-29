@@ -180,12 +180,11 @@ def main():
     app.add_handler(conv)
 
     port = int(os.getenv('PORT', 10000))
-    app.run_webhook(
+        app.run_webhook(
         listen='0.0.0.0',
         port=port,
-        path='/webhook',
-        url=os.environ['WEBHOOK_URL'],
-        secret_token=os.environ['WEBHOOK_SECRET'],
+        url_path='/webhook',
+        webhook_url=os.environ['WEBHOOK_URL'],
         max_connections=40
     )
 
