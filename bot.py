@@ -277,11 +277,13 @@ async def on_shutdown(app):
         logger.error(f"❌ Errore shutdown: {e}")
         raise
 
-def main():
+async def async_main():
     global application
     init_db()
+
     application = Application.builder().token(os.environ['TELEGRAM_TOKEN']).build()
     application.add_handler(CommandHandler("start", start))
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("messaggio", messaggio_start)],
         states={
@@ -293,13 +295,29 @@ def main():
         fallbacks=[],
     )
     application.add_handler(conv)
+
     app = web.Application()
     app.router.add_post('/webhook', webhook_handler)
     app.router.add_get('/health', health_check)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-    port = int(os.environ.get('PORT', 10000))
-    web.run_app(app, host='0.0.0.0', port=port, handle_signals=True)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+    await site.start()
+
+    # Avvia l'application telegram
+    await application.initialize()
+    await application.start()
+
+    logger.info("🚀 Server e bot avviati")
+    try:
+        await asyncio.Event().wait()  # Mantiene il processo attivo
+    finally:
+        await application.stop()
+        await application.shutdown()
+        await runner.cleanup()
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(async_main())
