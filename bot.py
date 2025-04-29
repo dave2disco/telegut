@@ -1,12 +1,17 @@
 import logging
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 import os
 import psycopg2
 from datetime import datetime
 from flask import Flask, request
 from threading import Thread
-import time
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackContext,
+    filters
+)
 
 # Configurazione logging
 logging.basicConfig(
@@ -18,13 +23,11 @@ logger = logging.getLogger(__name__)
 # Inizializzazione Flask
 app = Flask(__name__)
 
-# Variabili globali per l'updater
-updater = None
-dispatcher = None
-
-# Connessione al database con pool
+# Variabili globali
+application = None
 DB_POOL = None
 
+# Inizializzazione pool DB
 def init_db():
     global DB_POOL
     try:
@@ -52,7 +55,7 @@ def return_db_conn(conn):
         logger.error(f"Errore nel restituire connessione DB: {e}")
 
 # Funzione per salvare/aggiornare utente
-def save_user_id(user_id: int, username: str) -> bool:
+async def save_user_id(user_id: int, username: str) -> bool:
     conn = None
     try:
         conn = get_db_conn()
@@ -105,21 +108,21 @@ def save_user_id(user_id: int, username: str) -> bool:
             return_db_conn(conn)
 
 # Gestore comando /start
-def start(update: Update, context: CallbackContext) -> None:
+async def start(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
-    is_new = save_user_id(user.id, user.first_name)
+    is_new = await save_user_id(user.id, user.first_name)
     
     if is_new:
-        update.message.reply_text(f'✅ Ciao {user.first_name}! Registrazione completata.')
+        await update.message.reply_text(f'✅ Ciao {user.first_name}! Registrazione completata.')
     else:
-        update.message.reply_text(f'👋 Bentornato {user.first_name}! Sei già registrato.')
+        await update.message.reply_text(f'👋 Bentornato {user.first_name}! Sei già registrato.')
 
 # Endpoint webhook
 @app.route('/webhook', methods=['POST'])
 def webhook_handler():
     if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), updater.bot)
-        dispatcher.process_update(update)
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        application.update_queue.put(update)
     return 'ok', 200
 
 # Health check endpoint
@@ -128,39 +131,27 @@ def health_check():
     return {'status': 'healthy', 'timestamp': datetime.now().isoformat()}, 200
 
 # Funzione per impostare webhook
-def set_webhook():
+async def set_webhook():
     webhook_url = os.environ.get('WEBHOOK_URL')
     if not webhook_url:
         logger.error("WEBHOOK_URL non configurato!")
         return False
     
     try:
-        retry_count = 0
-        max_retries = 3
-        
-        while retry_count < max_retries:
-            try:
-                success = updater.bot.set_webhook(
-                    url=webhook_url,
-                    max_connections=100,
-                    allowed_updates=['message', 'callback_query']
-                )
-                if success:
-                    logger.info(f"Webhook configurato con successo: {webhook_url}")
-                    return True
-            except Exception as e:
-                logger.warning(f"Tentativo {retry_count + 1} fallito: {e}")
-                retry_count += 1
-                time.sleep(2)
-        
-        logger.error("Impossibile configurare webhook dopo diversi tentativi")
-        return False
+        async with application:
+            await application.bot.set_webhook(
+                url=webhook_url,
+                max_connections=100,
+                allowed_updates=['message', 'callback_query']
+            )
+        logger.info(f"Webhook configurato con successo: {webhook_url}")
+        return True
     except Exception as e:
         logger.error(f"Errore critico nel webhook: {e}")
         return False
 
 def main():
-    global updater, dispatcher
+    global application
     
     # Inizializza pool DB
     init_db()
@@ -171,14 +162,17 @@ def main():
         logger.error("TELEGRAM_TOKEN mancante!")
         return
     
-    updater = Updater(token, use_context=True)
-    dispatcher = updater.dispatcher
+    application = Application.builder().token(token).build()
     
     # Registra handlers
-    dispatcher.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("start", start))
     
     # Configura webhook in un thread separato
-    Thread(target=set_webhook).start()
+    Thread(target=lambda: application.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get('PORT', 5000)),
+        webhook_url=os.environ.get('WEBHOOK_URL')
+    ).start()
     
     # Avvia Flask
     port = int(os.environ.get('PORT', 5000))
