@@ -30,8 +30,8 @@ AUTHORIZED_USERS = [7618253421]
 # Stati conversazione
 WAITING_FOR_MESSAGE, WAITING_FOR_TIME, WAITING_FOR_DELAY = range(3)
 
-# Funzione di scheduling
-async def schedule_broadcast(message_data: dict, delay_seconds: float, bot):
+# Funzione di scheduling con notifica admin
+async def schedule_broadcast(message_data: dict, delay_seconds: float, bot, admin_id: int):
     await asyncio.sleep(delay_seconds)
     sent = failed = 0
     conn = DB_POOL.getconn()
@@ -60,6 +60,11 @@ async def schedule_broadcast(message_data: dict, delay_seconds: float, bot):
             except Exception as e:
                 failed += 1
                 logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
+        # Notifica all'admin
+        await bot.send_message(
+            chat_id=admin_id,
+            text=f"✅ Messaggio inviato a {sent} utenti. ❌ Falliti: {failed}"
+        )
         logger.info(f"✅ Broadcast automatico inviato: {sent} successi, {failed} falliti")
     finally:
         DB_POOL.putconn(conn)
@@ -130,6 +135,12 @@ async def start(update: Update, context: CallbackContext) -> None:
         logger.error(f"❌ Errore comando /start: {e}")
         await update.message.reply_text('⚠️ Si è verificato un errore, riprova più tardi.')
 
+# Comando /annulla per uscire da stati di conversazione
+async def cancel(update: Update, context: CallbackContext) -> int:
+    await update.message.reply_text('❌ Operazione annullata. Puoi ripartire con /messaggio.')
+    context.user_data.clear()
+    return ConversationHandler.END
+
 # --- Comando /messaggio (admin) ---
 async def messaggio_start(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
@@ -149,7 +160,9 @@ async def messaggio_send(update: Update, context: CallbackContext) -> int:
         data = {'type': 'video', 'file_id': msg.video.file_id, 'caption': msg.caption or ''}
     elif msg.document:
         data = {'type': 'document', 'file_id': msg.document.file_id, 'caption': msg.caption or ''}
+    # Salva dati messaggio e admin
     context.user_data['message_data'] = data
+    context.user_data['admin_id'] = update.effective_user.id
     # Inline keyboard per scelta invio
     keyboard = [
         [InlineKeyboardButton("Invia ORA", callback_data='send_now'),
@@ -163,10 +176,11 @@ async def handle_time_choice(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
     choice = query.data
-    message_data = context.user_data['message_data']
+    message_data = context.user_data.get('message_data')
+    admin_id = context.user_data.get('admin_id')
 
     if choice == 'send_now':
-        # Invia immediatamente
+        # Invia immediatamente (come prima)
         sent = failed = 0
         conn = DB_POOL.getconn()
         try:
@@ -193,12 +207,12 @@ async def handle_time_choice(update: Update, context: CallbackContext) -> int:
                 except Exception as e:
                     failed += 1
                     logger.warning(f"⚠️ Impossibile inviare a {user_id}: {e}")
-            await query.edit_message_text(f"✅ Messaggio inviato a {sent} utenti.\n❌ Falliti: {failed}")
+            await query.edit_message_text(f"✅ Messaggio inviato a {sent} utenti. ❌ Falliti: {failed}")
         finally:
             DB_POOL.putconn(conn)
     else:
         # Pianificazione: chiedi ore di ritardo
-        await query.edit_message_text("⏱️ Dopo quante ore vuoi inviare il messaggio?")
+        await query.edit_message_text("⏱️ Dopo quante ore vuoi inviare il messaggio? (inserisci un numero)")
         return WAITING_FOR_DELAY
 
     return ConversationHandler.END
@@ -210,9 +224,11 @@ async def handle_delay(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text("❌ Inserisci un numero valido di ore.")
         return WAITING_FOR_DELAY
     seconds = hours * 3600
-    message_data = context.user_data['message_data']
+    message_data = context.user_data.get('message_data')
+    admin_id = context.user_data.get('admin_id')
+    # Avvia scheduling con notifica admin
     context.application.create_task(
-        schedule_broadcast(message_data, seconds, context.bot)
+        schedule_broadcast(message_data, seconds, context.bot, admin_id)
     )
     await update.message.reply_text(f"✅ Messaggio programmato tra {hours} ore.")
     return ConversationHandler.END
@@ -260,11 +276,15 @@ async def on_shutdown(app):
         logger.error(f"❌ Errore shutdown: {e}")
         raise
 
+
 def main():
     global application
     init_db()
     application = Application.builder().token(os.environ['TELEGRAM_TOKEN']).build()
     application.add_handler(CommandHandler("start", start))
+    # Handler per annulla (fallback per tutte le conversazioni)
+    application.add_handler(CommandHandler("annulla", cancel))
+    # Conversazione messaggi
     conv = ConversationHandler(
         entry_points=[CommandHandler("messaggio", messaggio_start)],
         states={
@@ -272,7 +292,7 @@ def main():
             WAITING_FOR_TIME: [CallbackQueryHandler(handle_time_choice)],
             WAITING_FOR_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delay)],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("annulla", cancel)],
     )
     application.add_handler(conv)
     app = web.Application()
