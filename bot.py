@@ -1,6 +1,7 @@
 import logging
 import os
 import psycopg2
+from psycopg2 import pool
 from datetime import datetime
 from flask import Flask, request
 from threading import Thread
@@ -30,26 +31,25 @@ DB_POOL = None
 def init_db():
     global DB_POOL
     try:
-        DB_POOL = psycopg2.pool.SimpleConnectionPool(
+        DB_POOL = pool.SimpleConnectionPool(
             minconn=1,
             maxconn=10,
             dsn=os.environ['DATABASE_URL']
         )
         logger.info("Pool di connessioni al database inizializzato")
         
-        # Test immediato della connessione
-        conn = get_db_conn()
-        if conn:
-            conn.close()
+        # Test connessione
+        conn = DB_POOL.getconn()
+        conn.close()
     except Exception as e:
-        logger.error(f"Errore nell'inizializzazione del pool DB: {e}")
+        logger.error(f"Errore inizializzazione pool DB: {e}")
         raise
 
 def get_db_conn():
     try:
         return DB_POOL.getconn()
     except Exception as e:
-        logger.error(f"Errore nell'ottenere connessione DB: {e}")
+        logger.error(f"Errore ottenimento connessione DB: {e}")
         return None
 
 def return_db_conn(conn):
@@ -57,7 +57,7 @@ def return_db_conn(conn):
         try:
             DB_POOL.putconn(conn)
         except Exception as e:
-            logger.error(f"Errore nel restituire connessione DB: {e}")
+            logger.error(f"Errore restituzione connessione DB: {e}")
 
 # Funzione per salvare/aggiornare utente
 async def save_user_id(user_id: int, username: str) -> bool:
@@ -68,7 +68,7 @@ async def save_user_id(user_id: int, username: str) -> bool:
             return False
 
         with conn.cursor() as cur:
-            # Crea tabella se non esiste con indici
+            # Crea tabella se non esiste
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
@@ -81,7 +81,7 @@ async def save_user_id(user_id: int, username: str) -> bool:
                 CREATE INDEX IF NOT EXISTS idx_last_interaction ON users(last_interaction);
             """)
             
-            # Inserisci o aggiorna utente
+            # Inserimento/aggiornamento utente
             cur.execute("""
                 INSERT INTO users (user_id, username, last_interaction)
                 VALUES (%s, %s, %s)
@@ -95,11 +95,7 @@ async def save_user_id(user_id: int, username: str) -> bool:
             result = cur.fetchone()
             conn.commit()
             
-            if result:
-                logger.info(f"Nuovo utente registrato: {user_id}")
-                return True
-            logger.info(f"Utente già registrato: {user_id}")
-            return False
+            return bool(result)
             
     except Exception as e:
         logger.error(f"Errore DB: {e}")
@@ -140,28 +136,10 @@ def health_check():
     except Exception as e:
         return {'status': 'error', 'error': str(e)}, 500
 
-async def setup_webhook():
-    webhook_url = os.environ.get('WEBHOOK_URL')
-    if not webhook_url:
-        logger.error("WEBHOOK_URL non configurato!")
-        return False
-    
-    try:
-        await application.bot.set_webhook(
-            url=webhook_url,
-            max_connections=100,
-            allowed_updates=['message']
-        )
-        logger.info(f"Webhook configurato: {webhook_url}")
-        return True
-    except Exception as e:
-        logger.error(f"Errore webhook: {e}")
-        return False
-
 def run_bot():
     global application
     
-    # Configura bot
+    # Configurazione bot
     token = os.environ.get('TELEGRAM_TOKEN')
     if not token:
         logger.error("TELEGRAM_TOKEN mancante!")
@@ -170,12 +148,17 @@ def run_bot():
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     
-    # Configura webhook
+    # Configurazione webhook
+    webhook_url = os.environ.get('WEBHOOK_URL')
+    if not webhook_url:
+        logger.error("WEBHOOK_URL mancante!")
+        return
+    
     application.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get('PORT', 5000)),
-        webhook_url=os.environ.get('WEBHOOK_URL'),
-        secret_token='WEBHOOK_SECRET'  # Aggiungi questa variabile d'ambiente per sicurezza
+        webhook_url=webhook_url,
+        secret_token=os.environ.get('WEBHOOK_SECRET', 'default-secret')
     )
 
 if __name__ == '__main__':
