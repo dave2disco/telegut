@@ -3,10 +3,13 @@ services:
     name: telegram-bot
     runtime: python
     buildCommand: |
-      python -m pip install --upgrade pip
+      sudo apt-get update
+      sudo apt-get install -y libpq-dev python3-dev
       pip install -r requirements.txt
     startCommand: gunicorn --worker-tmp-dir /dev/shm --workers 4 --threads 2 --timeout 60 bot:app
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.1
       - key: DATABASE_URL
         fromDatabase:
           name: your-db-name
@@ -14,4 +17,6 @@ services:
       - key: TELEGRAM_TOKEN
         sync: false
       - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
         sync: false
